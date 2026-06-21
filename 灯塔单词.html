@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>灯塔单词 Beacon · 照亮你背单词的路</title>
+  <title>灯塔单词 · 最终版 · 照亮你背单词的路</title>
   <script>
     // Apply saved theme before paint to avoid a flash
     try { var _t = localStorage.getItem('vocab_theme'); if (_t) document.documentElement.dataset.theme = _t; } catch (e) {}
@@ -3126,87 +3126,67 @@ const ocrEngine = new OCREngine();
 
 
 /* ===== js/database.js ===== */
-// ===== IndexedDB Database =====
+// ===== LocalStorage Database (任何协议下双击即开即用) =====
 
-
-const DB_NAME = 'WordMemorizerDB';
-const DB_VERSION = 3;
+const DB_STORAGE_KEY = 'beacon_word_db_v1';
 
 class WordDatabase {
   constructor() {
-    this.db = null;
+    this.data = null;
+    this.ready = false;
+  }
+
+  _read() {
+    try {
+      const raw = localStorage.getItem(DB_STORAGE_KEY);
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  _write() {
+    try {
+      localStorage.setItem(DB_STORAGE_KEY, JSON.stringify(this.data));
+    } catch (e) {
+      console.warn('写入存储失败:', e);
+    }
   }
 
   async init() {
-    if (this.db) return this.db;
-
-    return new Promise((resolve, reject) => {
-      const request = indexedDB.open(DB_NAME, DB_VERSION);
-
-      request.onerror = () => reject(request.error);
-      request.onblocked = () => {
-        showToast('请关闭其他标签页后刷新', 'warning');
-        reject(new Error('Database blocked'));
+    if (this.ready) return;
+    const loaded = this._read();
+    if (loaded && loaded.books) {
+      this.data = loaded;
+    } else {
+      this.data = {
+        books: [],
+        words: [],
+        records: [],
+        nextBookId: 1,
+        nextWordId: 1,
+        nextRecordId: 1
       };
-      request.onsuccess = async () => {
-        this.db = request.result;
-        // Migrate words to default book if needed
-        await this._migrateWordsToBooks();
-        resolve(this.db);
-      };
-
-      request.onupgradeneeded = (event) => {
-        const db = event.target.result;
-        const oldVersion = event.oldVersion;
-
-        // Version 1: create words and studyRecords stores
-        if (oldVersion < 1) {
-          const wordStore = db.createObjectStore('words', { keyPath: 'id', autoIncrement: true });
-          wordStore.createIndex('word', 'word', { unique: false });
-          wordStore.createIndex('createdAt', 'createdAt', { unique: false });
-
-          const recordStore = db.createObjectStore('studyRecords', { keyPath: 'id', autoIncrement: true });
-          recordStore.createIndex('wordId', 'wordId', { unique: false });
-          recordStore.createIndex('date', 'date', { unique: false });
-        }
-
-        // Version 3: add books store and bookId index on words
-        if (oldVersion < 3) {
-          if (!db.objectStoreNames.contains('books')) {
-            const bookStore = db.createObjectStore('books', { keyPath: 'id', autoIncrement: true });
-            bookStore.createIndex('name', 'name', { unique: false });
-          }
-
-          if (db.objectStoreNames.contains('words')) {
-            const wordStore = event.target.transaction.objectStore('words');
-            if (!wordStore.indexNames.contains('bookId')) {
-              wordStore.createIndex('bookId', 'bookId', { unique: false });
-            }
-          }
-        }
-      };
-    });
+      // 默认书
+      this.data.books.push({
+        id: this.data.nextBookId++,
+        name: '默认单词书',
+        createdAt: Date.now()
+      });
+      this._write();
+    }
+    this.ready = true;
   }
 
-  // ===== Migration =====
-
-  async _migrateWordsToBooks() {
-    const books = await this.getAllBooks();
-    if (books.length === 0) {
-      // Create default book
-      await this.addBook({ name: '默认单词书', createdAt: Date.now() });
-    }
-
-    const allWords = await this.getAllWords();
-    const wordsWithoutBook = allWords.filter(w => !w.bookId);
-    if (wordsWithoutBook.length === 0) return;
-
-    const defaultBook = (await this.getAllBooks())[0];
-    if (!defaultBook) return;
-
-    for (const word of wordsWithoutBook) {
-      word.bookId = defaultBook.id;
-      await this._putWord(word);
+  _ensureDefaultBook() {
+    if (!this.data.books || this.data.books.length === 0) {
+      this.data.books.push({
+        id: this.data.nextBookId++,
+        name: '默认单词书',
+        createdAt: Date.now()
+      });
+      this._write();
     }
   }
 
@@ -3214,209 +3194,117 @@ class WordDatabase {
 
   async addBook(bookData) {
     await this.init();
-    const tx = this.db.transaction('books', 'readwrite');
-    const store = tx.objectStore('books');
-
-    return new Promise((resolve, reject) => {
-      const request = store.add({ ...bookData, createdAt: Date.now() });
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
+    const book = {
+      id: this.data.nextBookId++,
+      name: bookData.name || '新单词书',
+      createdAt: bookData.createdAt || Date.now()
+    };
+    this.data.books.push(book);
+    this._write();
+    return book.id;
   }
 
   async getAllBooks() {
     await this.init();
-    const tx = this.db.transaction('books', 'readonly');
-    const store = tx.objectStore('books');
-
-    return new Promise((resolve, reject) => {
-      const request = store.getAll();
-      request.onsuccess = () => resolve(request.result || []);
-      request.onerror = () => reject(request.error);
-    });
+    return this.data.books.slice();
   }
 
   async updateBook(id, updates) {
     await this.init();
-    const tx = this.db.transaction('books', 'readwrite');
-    const store = tx.objectStore('books');
-
-    return new Promise((resolve, reject) => {
-      const getReq = store.get(id);
-      getReq.onsuccess = () => {
-        const book = getReq.result;
-        if (!book) { reject(new Error('Book not found')); return; }
-        const updated = { ...book, ...updates };
-        const putReq = store.put(updated);
-        putReq.onsuccess = () => resolve(updated);
-        putReq.onerror = () => reject(putReq.error);
-      };
-      getReq.onerror = () => reject(getReq.error);
-    });
+    const book = this.data.books.find(b => b.id === id);
+    if (!book) throw new Error('Book not found');
+    Object.assign(book, updates);
+    this._write();
+    return book;
   }
 
   async deleteBook(id) {
     await this.init();
-    // Move words to default book first
-    const books = await this.getAllBooks();
+    const books = this.data.books;
     const defaultBook = books.find(b => b.id !== id) || books[0];
-
+    // 把该书里的词移到默认书
     if (defaultBook) {
-      const wordsInBook = await this.getWordsByBook(id);
-      for (const word of wordsInBook) {
-        word.bookId = defaultBook.id;
-        await this._putWord(word);
+      for (const w of this.data.words) {
+        if (w.bookId === id) w.bookId = defaultBook.id;
       }
     }
-
-    const tx = this.db.transaction('books', 'readwrite');
-    const store = tx.objectStore('books');
-
-    return new Promise((resolve, reject) => {
-      const request = store.delete(id);
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
-    });
+    this.data.books = books.filter(b => b.id !== id);
+    this._ensureDefaultBook();
+    this._write();
   }
 
   // ===== Word Operations =====
 
+  _newWordId() { return this.data.nextWordId++; }
+
   async addWord(wordData) {
     await this.init();
-    const tx = this.db.transaction('words', 'readwrite');
-    const store = tx.objectStore('words');
-
-    const data = {
+    const word = {
       ...wordData,
+      id: this._newWordId(),
       createdAt: Date.now(),
       reviewCount: 0,
       correctCount: 0,
       lastReviewed: null
     };
-
-    return new Promise((resolve, reject) => {
-      const request = store.add(data);
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
-  }
-
-  async _putWord(word) {
-    await this.init();
-    const tx = this.db.transaction('words', 'readwrite');
-    const store = tx.objectStore('words');
-
-    return new Promise((resolve, reject) => {
-      const request = store.put(word);
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
+    this.data.words.push(word);
+    this._write();
+    return word.id;
   }
 
   async updateWord(id, updates) {
     await this.init();
-    const tx = this.db.transaction('words', 'readwrite');
-    const store = tx.objectStore('words');
-
-    return new Promise((resolve, reject) => {
-      const getReq = store.get(id);
-      getReq.onsuccess = () => {
-        const word = getReq.result;
-        if (!word) {
-          reject(new Error('Word not found'));
-          return;
-        }
-        const updated = { ...word, ...updates };
-        const putReq = store.put(updated);
-        putReq.onsuccess = () => resolve(updated);
-        putReq.onerror = () => reject(putReq.error);
-      };
-      getReq.onerror = () => reject(getReq.error);
-    });
+    const word = this.data.words.find(w => w.id === id);
+    if (!word) throw new Error('Word not found');
+    Object.assign(word, updates);
+    this._write();
+    return word;
   }
 
   async deleteWord(id) {
     await this.init();
-    const tx = this.db.transaction('words', 'readwrite');
-    const store = tx.objectStore('words');
-
-    return new Promise((resolve, reject) => {
-      const request = store.delete(id);
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
-    });
+    this.data.words = this.data.words.filter(w => w.id !== id);
+    this._write();
   }
 
   async getWord(id) {
     await this.init();
-    const tx = this.db.transaction('words', 'readonly');
-    const store = tx.objectStore('words');
-
-    return new Promise((resolve, reject) => {
-      const request = store.get(id);
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
+    return this.data.words.find(w => w.id === id) || null;
   }
 
   async getAllWords() {
     await this.init();
-    const tx = this.db.transaction('words', 'readonly');
-    const store = tx.objectStore('words');
-
-    return new Promise((resolve, reject) => {
-      const request = store.getAll();
-      request.onsuccess = () => resolve(request.result || []);
-      request.onerror = () => reject(request.error);
-    });
+    return this.data.words.slice();
   }
 
   async getWordsByBook(bookId) {
     await this.init();
-    const tx = this.db.transaction('words', 'readonly');
-    const store = tx.objectStore('words');
-    const index = store.index('bookId');
-
-    return new Promise((resolve, reject) => {
-      const request = index.getAll(bookId);
-      request.onsuccess = () => resolve(request.result || []);
-      request.onerror = () => reject(request.error);
-    });
+    return this.data.words.filter(w => w.bookId === bookId);
   }
 
   async getUnlearnedWords() {
-    const allWords = await this.getAllWords();
-    return allWords.filter(w => (w.reviewCount || 0) === 0);
+    const all = await this.getAllWords();
+    return all.filter(w => (w.reviewCount || 0) === 0);
   }
 
   async batchImport(wordsArray, bookId) {
     await this.init();
-    const tx = this.db.transaction('words', 'readwrite');
-    const store = tx.objectStore('words');
-
-    const promises = wordsArray.map(word => {
-      return new Promise((resolve, reject) => {
-        const data = {
-          ...word,
-          bookId: bookId || word.bookId,
-          createdAt: Date.now(),
-          reviewCount: 0,
-          correctCount: 0,
-          lastReviewed: null
-        };
-        const request = store.add(data);
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => {
-          if (request.error && request.error.name === 'ConstraintError') {
-            resolve(null);
-          } else {
-            reject(request.error);
-          }
-        };
-      });
-    });
-
-    return Promise.all(promises);
+    const results = [];
+    for (const word of wordsArray) {
+      const data = {
+        ...word,
+        id: this._newWordId(),
+        bookId: bookId || word.bookId,
+        createdAt: Date.now(),
+        reviewCount: 0,
+        correctCount: 0,
+        lastReviewed: null
+      };
+      this.data.words.push(data);
+      results.push(data.id);
+    }
+    this._write();
+    return results;
   }
 
   async searchWords(query) {
@@ -3424,8 +3312,8 @@ class WordDatabase {
     if (!query) return words;
     const lowerQuery = query.toLowerCase();
     return words.filter(w =>
-      w.word.toLowerCase().includes(lowerQuery) ||
-      w.meaning.includes(query)
+      (w.word || '').toLowerCase().includes(lowerQuery) ||
+      (w.meaning || '').includes(query)
     );
   }
 
@@ -3433,104 +3321,91 @@ class WordDatabase {
 
   async recordStudy(wordId, isCorrect) {
     await this.init();
-    const tx = this.db.transaction(['words', 'studyRecords'], 'readwrite');
-    const wordStore = tx.objectStore('words');
-    const recordStore = tx.objectStore('studyRecords');
-
-    const word = await new Promise((resolve, reject) => {
-      const req = wordStore.get(wordId);
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-
+    const word = this.data.words.find(w => w.id === wordId);
     if (word) {
       word.reviewCount = (word.reviewCount || 0) + 1;
       if (isCorrect) word.correctCount = (word.correctCount || 0) + 1;
       word.lastReviewed = Date.now();
-      wordStore.put(word);
     }
-
-    recordStore.add({
+    this.data.records.push({
+      id: this.data.nextRecordId++,
       wordId,
-      isCorrect,
+      isCorrect: !!isCorrect,
       date: Date.now()
     });
+    this._write();
   }
 
   // ===== Data Management =====
 
   async exportData() {
-    const words = await this.getAllWords();
-    const books = await this.getAllBooks();
-    return JSON.stringify({ words, books }, null, 2);
+    await this.init();
+    return JSON.stringify({
+      words: this.data.words,
+      books: this.data.books
+    }, null, 2);
   }
 
   async importData(jsonString) {
     const data = JSON.parse(jsonString);
     if (!data.words || !Array.isArray(data.words)) throw new Error('Invalid data format');
+    await this.init();
 
-    await this.clearAllWords();
-    await this.clearAllBooks();
+    this.data.books = [];
+    this.data.words = [];
+    this.data.nextBookId = 1;
+    this.data.nextWordId = 1;
 
-    // Import books first
-    const bookMap = new Map(); // oldId -> newId
+    const bookMap = new Map();
     if (data.books && Array.isArray(data.books)) {
       for (const book of data.books) {
         const oldId = book.id;
-        delete book.id;
-        const newId = await this.addBook(book);
+        const newId = this.data.nextBookId++;
+        this.data.books.push({ id: newId, name: book.name || '导入单词书', createdAt: book.createdAt || Date.now() });
         bookMap.set(oldId, newId);
       }
     }
-
-    // If no books in backup, create default
     if (bookMap.size === 0) {
-      const defaultId = await this.addBook({ name: '默认单词书', createdAt: Date.now() });
+      const defaultId = this.data.nextBookId++;
+      this.data.books.push({ id: defaultId, name: '默认单词书', createdAt: Date.now() });
       bookMap.set(null, defaultId);
       bookMap.set(undefined, defaultId);
     }
 
-    const wordsToImport = data.words.map(item => ({
-      word: item.word || '',
-      meaning: item.meaning || '',
-      sentence: item.sentence || '',
-      phonetic: item.phonetic || '',
-      phoneticUk: item.phoneticUk || '',
-      phoneticUs: item.phoneticUs || '',
-      pos: item.pos || '',
-      currentScore: item.currentScore || 0,
-      mastered: item.mastered || false,
-      bookId: bookMap.get(item.bookId) || bookMap.values().next().value,
-      reviewCount: item.reviewCount || 0,
-      correctCount: item.correctCount || 0,
-      lastReviewed: item.lastReviewed || null
-    }));
-
-    return this.batchImport(wordsToImport);
+    for (const item of data.words) {
+      this.data.words.push({
+        id: this.data.nextWordId++,
+        word: item.word || '',
+        meaning: item.meaning || '',
+        sentence: item.sentence || '',
+        phonetic: item.phonetic || '',
+        phoneticUk: item.phoneticUk || '',
+        phoneticUs: item.phoneticUs || '',
+        pos: item.pos || '',
+        currentScore: item.currentScore || 0,
+        mastered: item.mastered || false,
+        bookId: bookMap.get(item.bookId) || bookMap.values().next().value,
+        reviewCount: item.reviewCount || 0,
+        correctCount: item.correctCount || 0,
+        lastReviewed: item.lastReviewed || null,
+        createdAt: item.createdAt || Date.now()
+      });
+    }
+    this._write();
   }
 
   async clearAllWords() {
     await this.init();
-    const tx = this.db.transaction('words', 'readwrite');
-    const store = tx.objectStore('words');
-
-    return new Promise((resolve, reject) => {
-      const request = store.clear();
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
-    });
+    this.data.words = [];
+    this.data.nextWordId = 1;
+    this._write();
   }
 
   async clearAllBooks() {
     await this.init();
-    const tx = this.db.transaction('books', 'readwrite');
-    const store = tx.objectStore('books');
-
-    return new Promise((resolve, reject) => {
-      const request = store.clear();
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
-    });
+    this.data.books = [];
+    this.data.nextBookId = 1;
+    this._write();
   }
 
   async getStats() {
